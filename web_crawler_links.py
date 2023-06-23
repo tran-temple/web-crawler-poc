@@ -1,10 +1,62 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import time
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import asyncio
 import random
 import colorama
+import socket
+import sys
+from fake_useragent import UserAgent
+
+class HostHeaderSSLAdapter(requests.adapters.HTTPAdapter):
+
+    ipDict = {}
+
+    def resolve(self, hostname):
+        # a dummy DNS resolver
+        import random
+        ip = ''
+        if hostname in self.ipDict.keys():
+            print('reuse')
+            ip = self.ipDict[hostname]
+        else:
+            print('add new')
+            ip = socket.gethostbyname(hostname)
+            self.ipDict[hostname] = ip
+        print(self.ipDict)
+        print('resolve: ', ip)
+        return ip
+
+    def send(self, request, **kwargs):
+        from urllib.parse import urlparse
+
+        connection_pool_kwargs = self.poolmanager.connection_pool_kw
+
+        result = urlparse(request.url)
+        resolved_ip = self.resolve(result.hostname)
+
+        if result.scheme == 'https' and resolved_ip:
+            request.url = request.url.replace(
+                'https://' + result.hostname,
+                'https://' + resolved_ip,
+            )
+            connection_pool_kwargs['server_hostname'] = result.hostname  # SNI
+            connection_pool_kwargs['assert_hostname'] = result.hostname
+
+            # overwrite the host header
+            request.headers['Host'] = result.hostname
+        else:
+            # theses headers from a previous request may have been left
+            connection_pool_kwargs.pop('server_hostname', None)
+            connection_pool_kwargs.pop('assert_hostname', None)
+
+        return super(HostHeaderSSLAdapter, self).send(request, **kwargs)
+
+
+    
 
 seenLinks = {}
 
@@ -21,9 +73,15 @@ externalLinks = []
 previousDepth = 0
 maxCrawlingDepth = 5
 totalLinks = 0
+totalCrawledLinks = 0
 
 mainDomain = None
 mainParsedUrl = None
+statedTime = None
+
+mainSession = None
+
+
 
 # Set up the list of color using for printing
 colorama.init()
@@ -43,7 +101,15 @@ class CreateLink:
 
 # This function is to start crawling from the seed page rely on the crawled depth level
 async def crawlAll(startURL, maxDepth = 5):
-    global rootNode, currentNode, mainDomain, maxCrawlingDepth, mainParsedUrl
+    global rootNode, currentNode, mainDomain, maxCrawlingDepth, mainParsedUrl, startedTime, mainSession
+    mainSession = requests.Session()
+    retry = Retry(connect=5, backoff_factor=1, status_forcelist=[ 500, 502, 503, 504 ])
+
+    mainSession.mount("http://", HostHeaderSSLAdapter())
+    mainSession.mount("https://", HostHeaderSSLAdapter())
+
+
+    startedTime = time.time()
     try:
         mainParsedUrl = urlparse(startURL)
         # print("mainParsedURL", mainParsedUrl)
@@ -51,14 +117,111 @@ async def crawlAll(startURL, maxDepth = 5):
         print(f"{RED}URL is not valid - {err}{RESET}")
         return
     
-    mainDomain = mainParsedUrl.hostname
+    #mainDomain = mainParsedUrl.hostname
     maxCrawlingDepth = maxDepth
     startLinkObj = CreateLink(startURL, 0, None)
     rootNode = currentNode = startLinkObj
+    # add to link queue
+    addToLinkQueue(startLinkObj)
 
     # addToLinkQueue(currentNode)
-    await findLinks(currentNode)
+    # await findLinks(currentNode)
+    await crawls()
+    
+
+
     printFurtherInfo()
+    print("Run time: ", time.time() - startedTime)
+
+
+async def crawls():
+    #global currentNode, rootNode, maxCrawlingDepth, totalLinks
+    global maxCrawlingDepth, totalLinks, totalCrawledLinks, startedTime
+
+    linkObj = getNextInQueue()
+    while linkObj is not None and linkObj.depth <= maxCrawlingDepth:
+        print(f"{BLUE}Crawling URL: {linkObj.url}{RESET}")
+        try:
+            ua = UserAgent()
+            user_agent = ua.random
+            print('user_agent: ', user_agent)
+            
+            headers = {
+                        'User-Agent': user_agent
+                    } 
+            response = mainSession.get(linkObj.url, headers=headers, timeout=5)
+            totalCrawledLinks = totalCrawledLinks + 1
+
+            # Check the status code of page
+            if response.status_code >= 200 and response.status_code < 300:
+                print(f"{GREEN}--- Status: {response.status_code} - Success, Link is Okay.{RESET}")
+            else:
+                if response.status_code >= 400 and response.status_code < 500:
+                    print(f"{RED}--- Status: {response.status_code} - Client Error, Link is broken! - {RESET}")
+
+                if response.status_code >= 500 and response.status_code < 600:
+                    print(f"{RED}--- Status: {response.status_code} - Server Error, Link is broken! - {RESET}")
+
+                if response.status_code >= 600:
+                    print(f"{RED}--- Status: {response.status_code} - Link maybe not permited for scanning by host! - {RESET}")
+
+            # Notes for content-type is not html: some links might be the video/mp4, audio/mp3, application/pdf, image, etc. - no need to crawl it or parse it to get text
+            contentType = response.headers.get('content-type')
+
+            if "text/html" in contentType :
+                soup = BeautifulSoup(response.text, "html.parser")
+                links = soup.find_all("a", href=True)
+                
+                if len(links) > 0:
+                    print(f"{BLUE}Total links of this URL: {len(links)}{RESET}")
+                    totalLinks = totalLinks + len(links)
+
+                    for link in links:
+                        # Test ouput link
+                        # print("Test output link: " + link["href"])
+
+                        reqLink = checkDomain(link["href"])
+                        # print('Test checkDomain: ', reqLink)
+                        
+                        if reqLink:
+                            if reqLink != linkObj.url:
+                                # print("pass 1")
+                                newLinkObj = CreateLink(reqLink, linkObj.depth + 1, linkObj)
+                                # print("pass 2")
+                                addToLinkQueue(newLinkObj)
+                                # print("pass 3")
+                else:
+                    print(f"{GRAY}No more links found for {linkObj.url}{RESET}")
+            else:
+                print(f"{GRAY}No more sub-links found for {linkObj.url}{RESET}")
+        except requests.exceptions.ConnectionError as conErr:
+            print(f"{RED}ConnectionError {conErr}{RESET}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.Timeout as timeErr: 
+            print(f"{RED}Timeout {timeErr}{RESET}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.TooManyRedirects as tooErr:
+            print(f"{RED}TooManyRedirects {tooErr}{RESET}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.RequestException as reqErr:
+            print(f"{RED}RequestException {reqErr}{RESET}")
+            print("Run time: ", time.time() - startedTime)
+        except Exception as err:
+            print(f"{RED}Something went wrong... {err}{RESET}")
+            # await asyncio.sleep(20)
+            print("Run time: ", time.time() - startedTime)
+            raise SystemExit(err)
+            # setRootNode()
+            # printTree()
+
+        linkObj = getNextInQueue()
+        # print("Test depth - ", nextLinkObj.depth)
+        # print("Test maxCrawlingDepth - ", maxCrawlingDepth)
+        if linkObj is not None and linkObj.depth > maxCrawlingDepth:
+            linkObj = None
+
+    setRootNode()
+    printTree()
 
 # This function is to start the function find links of the crawled URL
 async def crawl(linkObj):
@@ -67,12 +230,44 @@ async def crawl(linkObj):
 # This function is to get the HTML and look for the links inside the page
 async def findLinks(linkObj):
     #global currentNode, rootNode, maxCrawlingDepth, totalLinks
-    global maxCrawlingDepth, totalLinks
+    global maxCrawlingDepth, totalLinks, totalCrawledLinks, startedTime
 
     print(f"{BLUE}Crawling URL: {linkObj.url}{RESET}")
 
     try:
-        response = requests.get(linkObj.url, timeout = 30)
+        # user_agents = [ 
+        #     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36', 
+        #     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36', 
+        #     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36', 
+        #     'Mozilla/5.0 (iPhone; CPU iPhone OS 12_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148', 
+        #     'Mozilla/5.0 (Linux; Android 11; SM-G960U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.72 Mobile Safari/537.36' 
+        # ] 
+
+        # user_agent = random.choice(user_agents) 
+
+        ua = UserAgent()
+        user_agent = ua.random
+        print('user_agent: ', user_agent)
+        
+        headers = {
+                    'User-Agent': user_agent
+                } 
+    
+        # session = requests.Session()
+        # retry = Retry(connect=5, backoff_factor=1, status_forcelist=[ 500, 502, 503, 504 ])
+       
+
+        
+        # session.mount("http://", HTTPAdapter(max_retries=retry))
+        # session.mount("https://", HTTPAdapter(max_retries=retry))
+        
+
+        # session.mount("http://", HostHeaderSSLAdapter())
+        # session.mount("https://", HostHeaderSSLAdapter())
+        #response = requests.get(linkObj.url, timeout=5, headers=headers)
+
+        response = mainSession.get(linkObj.url, headers=headers, timeout=5)
+        totalCrawledLinks = totalCrawledLinks + 1
 
         # Check the status code of page
         if response.status_code >= 200 and response.status_code < 300:
@@ -116,29 +311,44 @@ async def findLinks(linkObj):
                 print(f"{GRAY}No more links found for {linkObj.url}{RESET}")
         else:
             print(f"{GRAY}No more sub-links found for {linkObj.url}{RESET}")
-
-        nextLinkObj = getNextInQueue()
-        # print("Test depth - ", nextLinkObj.depth)
-        # print("Test maxCrawlingDepth - ", maxCrawlingDepth)
-        if nextLinkObj and nextLinkObj.depth <= maxCrawlingDepth:
-            #Random sleep
-            #It is very important to make this long enough to avoid spamming the website we want to scrape
-            #if we choose a short time we will potentially be blocked or kill the website we want to crawl
-            #time is in seconds here
-            miniumWaitTime = 0.5
-            maxiumWaitTime = 5
-            waitTime = round(miniumWaitTime + (random.random() * (maxiumWaitTime - miniumWaitTime)))
-            print(f"{GRAY}Wait for {waitTime} seconds{RESET}")
-            # time.sleep(waitTime)
-            await asyncio.sleep(waitTime)
-            # next url crawling
-            await crawl(nextLinkObj)
-        else:
-            setRootNode()
-            printTree()
-
+    except requests.exceptions.ConnectionError as conErr:
+        print(f"{RED}ConnectionError {conErr}{RESET}")
+        print("Run time: ", time.time() - startedTime)
+    except requests.exceptions.Timeout as timeErr: 
+        print(f"{RED}Timeout {timeErr}{RESET}")
+        print("Run time: ", time.time() - startedTime)
+    except requests.exceptions.TooManyRedirects as tooErr:
+        print(f"{RED}TooManyRedirects {tooErr}{RESET}")
+        print("Run time: ", time.time() - startedTime)
+    except requests.exceptions.RequestException as reqErr:
+        print(f"{RED}RequestException {reqErr}{RESET}")
+        print("Run time: ", time.time() - startedTime)
     except Exception as err:
         print(f"{RED}Something went wrong... {err}{RESET}")
+        # await asyncio.sleep(20)
+        print("Run time: ", time.time() - startedTime)
+        raise SystemExit(err)
+        # setRootNode()
+        # printTree()
+
+    nextLinkObj = getNextInQueue()
+    # print("Test depth - ", nextLinkObj.depth)
+    # print("Test maxCrawlingDepth - ", maxCrawlingDepth)
+    if nextLinkObj and nextLinkObj.depth <= maxCrawlingDepth:
+        #Random sleep
+        #It is very important to make this long enough to avoid spamming the website we want to scrape
+        #if we choose a short time we will potentially be blocked or kill the website we want to crawl
+        #time is in seconds here
+        # miniumWaitTime = 0.5
+        # maxiumWaitTime = 5
+        # waitTime = round(miniumWaitTime + (random.random() * (maxiumWaitTime - miniumWaitTime)))
+        # print(f"{GRAY}Wait for {waitTime} seconds{RESET}")
+        # time.sleep(waitTime)
+        # waitTime = 1
+        # await asyncio.sleep(waitTime)
+        # next url crawling
+        await crawl(nextLinkObj)
+    else:
         setRootNode()
         printTree()
 
@@ -198,6 +408,7 @@ def printTree():
     addToPrint(rootNode)
     print("\n|".join(printList))
     totalITLinks = len(printList)
+    print(f"{GREEN}Total Crawled Internal Links (exclude duplicates): {totalCrawledLinks}{RESET}")
     print(f"{GREEN}Total Internal Links (exclude duplicates): {totalITLinks}{RESET}")
 
 def printFurtherInfo():
@@ -220,11 +431,19 @@ def printFurtherInfo():
     print(f"{BLUE}Total links: {totalLinks}{RESET}")
 
 def checkExternalLinks():
-    global externalLinks
+    global externalLinks, startedTime
     
     for link in externalLinks:
         try:
-            response = requests.get(link, timeout = 30)
+            ua = UserAgent()
+            user_agent = ua.random
+            print('user_agent: ', user_agent)
+            
+            headers = {
+                        'User-Agent': user_agent
+                    } 
+            response = mainSession.get(link, headers=headers, timeout=5)
+            # response = requests.get(link, timeout = 30)
             print(f"- Checking external link: {link}")
             # Check the status code of page
             if response.status_code >= 200 and response.status_code < 300:
@@ -238,8 +457,28 @@ def checkExternalLinks():
 
                 if response.status_code >= 600:
                     print(f"{RED}--- Status: {response.status_code} - Link maybe not permited for scanning by host! - {RESET}")
+        except requests.exceptions.ConnectionError as conErr:
+            print(f"{RED}ConnectionError {conErr}{RESET}")
+            print(f"-External link: {link}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.Timeout as timeErr: 
+            print(f"{RED}Timeout {timeErr}{RESET}")
+            print(f"-External link: {link}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.TooManyRedirects as tooErr:
+            print(f"{RED}TooManyRedirects {tooErr}{RESET}")
+            print(f"-External link: {link}")
+            print("Run time: ", time.time() - startedTime)
+        except requests.exceptions.RequestException as reqErr:
+            print(f"{RED}RequestException {reqErr}{RESET}")
+            print(f"-External link: {link}")
+            print("Run time: ", time.time() - startedTime)
         except Exception as err:
             print(f"{RED}Something went wrong... {err}{RESET}")
+            print(f"-External link: {link}")
+            # await asyncio.sleep(20)
+            print("Run time: ", time.time() - startedTime)
+            raise SystemExit(err)
     
 
 # This function is to add links for printing
@@ -263,11 +502,13 @@ def addToLinkQueue(linkObj):
 # This function is to get the link for crawling
 def getNextInQueue():
     global linksQueue, previousDepth
-    nextLink = linksQueue.pop(0)
-    if nextLink and nextLink.depth > previousDepth:
-        previousDepth = nextLink.depth
-        #print(f"------- Crawling on Depth Level {previousDepth} --------")
-    return nextLink
+    if len(linksQueue) > 0:
+        nextLink = linksQueue.pop(0)
+        if nextLink and nextLink.depth > previousDepth:
+            previousDepth = nextLink.depth
+            print(f"------- Crawling on Depth Level {previousDepth} --------")
+        return nextLink
+    return None
 
 # This function is to add to the list of seen links
 def addToSeen(linkObj):
@@ -281,9 +522,10 @@ def linkInSeenListExists(linkObj):
 
 # This is the main function to execute, 
 if __name__ == "__main__":
-    rootURL = "https://www.consumercomplianceoutlook.org/"
-    # rootURL = "https://www.philadelphiafed.org/"
-    depth = 1
+    # sys.setrecursionlimit(10000)
+    # rootURL = "https://www.consumercomplianceoutlook.org/"
+    rootURL = "https://www.philadelphiafed.org/"
+    depth = 10
     # Test crawling
     loop = asyncio.get_event_loop()
     loop.run_until_complete(crawlAll(rootURL, depth))
